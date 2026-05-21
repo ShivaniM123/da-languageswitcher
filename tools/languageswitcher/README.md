@@ -1,9 +1,9 @@
-# Language Switcher
+# Language Mapper
 
 A Document Authoring (DA) **library plugin** that helps authors jump to the same page in other locales and run bulk **preview** / **publish** for every language defined in **`placeholders.json`**.
 
 ## Overview
-Language Switcher is for same-page, different-language navigation. It helps authors jump to the equivalent 
+Language Mapper is for same-page, different-language navigation. It helps authors jump to the equivalent 
 path for the document they are editing.
 
 ## Features
@@ -28,9 +28,6 @@ path for the document they are editing.
   * Allows users to preview/publish all available versions of the current page in a single action.
   The plugin validates each page and displays corresponding results such as successful preview/publish, 404 page not found, unauthorized access and other errors.
 
-6. **Intelligent Fallback Navigation**
-  If no mapping is found in `placeholders.json`, the plugin falls back to updating only the locale in the URL while preserving the existing page path.
-
 
 ## How to Use
 
@@ -41,7 +38,7 @@ path for the document they are editing.
 ![Example UI:](placeholders.png)
 
 3. Open the page you want to switch from (any supported language) in DA
-4. Open DA Language Switcher from the Library. 
+4. Open DA Language Mapper from the Library. 
 5. Choose a language if the dropdown appears(for more than 2 languages). Choose one of the available actions:
   a) Open Page for Selected Language → Opens the equivalent page in the chosen language
   b) Open Page for All Languages → Opens all available localized versions of the current page
@@ -70,7 +67,7 @@ tools/languageswitcher/
 
 | title | path | icon | experience |
 | ----- | ---- | ---- | ---------- |
-| `Language Switcher` | `/tools/languageswitcher/languageswitcher.html` | `https://main--<repo>--<org>.aem.page/tools/languageswitcher/icons/language-icon.svg` | `dialog` |
+| `Language Mapper` | `/tools/languageswitcher/languageswitcher.html` | `https://main--<repo>--<org>.aem.page/tools/languageswitcher/icons/language-icon.svg` | `dialog` |
 
 ## Loading
 
