@@ -15,9 +15,66 @@ import {
   DEFAULT_SHEET,
   detectLocaleColumnKeys,
 } from './placeholders.js';
+import {
+  createAemFetcher,
+  buildAemAdminPath,
+  previewPages,
+  publishPages,
+  summarizeBulkResult,
+  permissionDeniedMessage,
+} from './aem-admin.js';
+import {
+  checkDaContentAccess,
+  permissionDeniedMessageForAccess,
+  permissionDeniedMessageForPreview,
+  permissionDeniedMessageForPublish,
+  publishDeniedHoverHint,
+} from './da-permissions.js';
 
 const PRIMARY_LABEL_WITH_PICKER = 'Open page for selected language';
-let resolvedDaPageUrl = '';
+const LANG_SELECT_PLACEHOLDER = 'Select…';
+const BULK_MESSAGE_SUCCESS_DISMISS_MS = 5000;
+
+/** Always show locale codes in lowercase (avoids DA global strong { uppercase }). */
+const formatLocaleDisplay = (locale) => {
+  const s = String(locale ?? '').trim();
+  return s ? s.toLocaleLowerCase('en') : '';
+};
+
+const openPageInLabel = (locale) => `Open page in ${formatLocaleDisplay(locale)}`;
+
+const trimmed = (value) => String(value ?? '').trim();
+
+const AEM_FALLBACK_ACCESS = {
+  authenticated: true,
+  status: 0,
+  permissions: ['read', 'write'],
+  canRead: true,
+  canWrite: true,
+  canPreview: true,
+  canPublish: true,
+  denied: false,
+  message: '',
+};
+
+const NO_DA_ACCESS = {
+  authenticated: false,
+  status: 0,
+  permissions: [],
+  canRead: false,
+  canWrite: false,
+  canPreview: false,
+  canPublish: false,
+  denied: true,
+  message: '',
+};
+
+let cachedPanel = null;
+
+function getPanel() {
+  if (!cachedPanel) cachedPanel = document.querySelector('.ls-panel');
+  return cachedPanel;
+}
 
 const SETTINGS = {
   tier: 'page',
@@ -40,18 +97,22 @@ function pickDaView(context) {
 function getUi() {
   return {
     statusEl: document.getElementById('status'),
-    previewEl: document.getElementById('preview'),
-    previewBlock: document.getElementById('previewBlock'),
-    sourceBlock: document.getElementById('sourceBlock'),
-    sourceEl: document.getElementById('da-source-url-field'),
+    contentCardEl: document.getElementById('contentCard'),
+    bulkMessageEl: document.getElementById('bulkMessage'),
+    bulkFooter: document.getElementById('bulkFooter'),
     actionsEl: document.getElementById('actions'),
     langRow: document.getElementById('langRow'),
     langCombobox: document.getElementById('langCombobox'),
     langTrigger: document.getElementById('langSelectTrigger'),
     langMenu: document.getElementById('langSelectMenu'),
     langValue: document.getElementById('langSelectValue'),
+    currentLocaleEl: document.getElementById('currentLocale'),
+    currentLocaleValue: document.getElementById('currentLocaleValue'),
     openBtn: document.getElementById('open'),
+    openLabel: document.getElementById('openLabel'),
     openAllBtn: document.getElementById('openAll'),
+    previewAllBtn: document.getElementById('previewAll'),
+    publishAllBtn: document.getElementById('publishAll'),
   };
 }
 
@@ -75,69 +136,150 @@ function writeCache(key, rows, ttlMs) {
   }
 }
 
-function displayUrl(u) {
-  if (u == null || u === '') return '';
-  if (typeof u === 'string') return u.trim();
-  if (typeof u === 'object' && typeof u.href === 'string') return u.href.trim();
-  return String(u).trim();
-}
-
 function openUrlsInNewTabs(urls) {
   urls.filter(Boolean).forEach((href) => {
     window.open(typeof href === 'string' ? href : String(href), '_blank', 'noopener,noreferrer');
   });
 }
 
-function scheduleCloseLibrary(actions) {
-  if (typeof actions?.closeLibrary === 'function') window.setTimeout(() => actions.closeLibrary(), 300);
+function setBulkMessage(ui, text, opts = {}) {
+  if (!ui.bulkMessageEl) return;
+  const msg = trimmed(text);
+  const isError = opts.isError === true;
+  const isLoading = opts.isLoading === true;
+  const isSuccess = opts.isSuccess === true;
+  ui.bulkMessageEl.textContent = msg;
+  ui.bulkMessageEl.hidden = !msg;
+  ui.bulkMessageEl.classList.toggle('is-error', Boolean(isError && msg && !isLoading));
+  ui.bulkMessageEl.classList.toggle('is-loading', Boolean(isLoading && msg));
+  ui.bulkMessageEl.classList.toggle('is-success', Boolean(isSuccess && msg && !isLoading));
 }
 
-function setUi(ui, status, previewUrl, canOpen, actions, opts = {}) {
-  const showLangRow = opts.showLangRow === true;
-  const showOpenAll = opts.showOpenAll === true;
-  const sourceUrlText = displayUrl(opts.sourceUrl) || displayUrl(resolvedDaPageUrl);
+function setOpenLabel(ui, label) {
+  const text = typeof label === 'string' && label.trim() ? label.trim() : PRIMARY_LABEL_WITH_PICKER;
+  if (ui.openLabel) ui.openLabel.textContent = text;
+  else if (ui.openBtn) ui.openBtn.textContent = text;
+}
 
+function setCurrentLocale(ui, locale) {
+  if (!ui.currentLocaleEl) return;
+  const loc = String(locale || '').trim();
+  if (!loc) {
+    ui.currentLocaleEl.hidden = true;
+    return;
+  }
+  ui.currentLocaleEl.hidden = false;
+  if (ui.currentLocaleValue) ui.currentLocaleValue.textContent = formatLocaleDisplay(loc);
+}
+
+function wireBulkBtn(btn, { hidden, disabled, title, onClick }) {
+  if (!btn) return;
+  btn.hidden = hidden;
+  btn.disabled = disabled;
+  btn.title = title;
+  btn.onclick = onClick;
+}
+
+function setUi(ui, opts = {}) {
+  const {
+    status = '',
+    statusIsWarning = false,
+    bulkMessage = '',
+    bulkMessageIsError = false,
+    openUrl = null,
+    canOpen = false,
+    showContentCard = true,
+    showLangRow = false,
+    showOpenAll = false,
+    showPreviewAll = true,
+    showPublishAll = true,
+    openDisabled = false,
+    bulkDisabled = false,
+    openPrimaryLabel,
+    currentLocale,
+    openAllClick,
+    previewAllClick,
+    publishAllClick,
+    bulkMessageIsLoading = false,
+    bulkMessageIsSuccess = false,
+    toolAccess = null,
+    hasAemFetch = false,
+  } = opts;
+
+  const statusText = trimmed(status);
+  const statusVisible = Boolean(statusText);
   ui.statusEl.textContent = status;
-  ui.statusEl.hidden = !String(status || '').trim() && Boolean(previewUrl);
+  ui.statusEl.hidden = !statusVisible;
+  ui.statusEl.classList.toggle('is-warning', statusVisible && statusIsWarning);
+  if (ui.contentCardEl) ui.contentCardEl.hidden = !showContentCard;
+  const panel = getPanel();
+  const panelLoading = panel?.classList.contains('ls-loading');
+  if (panel) {
+    const statusOnly = statusVisible && !showContentCard;
+    panel.classList.toggle('ls-minimal', statusOnly);
+    panel.classList.toggle('ls-pending', !showContentCard && !statusVisible && !panelLoading);
+  }
   ui.langRow.hidden = !showLangRow;
+  setCurrentLocale(ui, currentLocale);
+  setBulkMessage(ui, bulkMessage, {
+    isError: bulkMessageIsError,
+    isLoading: bulkMessageIsLoading,
+    isSuccess: bulkMessageIsSuccess,
+  });
 
-  if (sourceUrlText) {
-    ui.sourceBlock.hidden = false;
-    ui.sourceEl.textContent = sourceUrlText;
-  } else {
-    ui.sourceBlock.hidden = true;
-    ui.sourceEl.textContent = '';
+  if (ui.bulkFooter) {
+    ui.bulkFooter.hidden = panelLoading
+      || !showContentCard
+      || (!showPreviewAll && !showPublishAll && !bulkMessage);
   }
 
-  if (previewUrl) {
-    ui.previewBlock.hidden = false;
-    ui.previewEl.textContent = previewUrl;
-  } else {
-    ui.previewBlock.hidden = true;
-    ui.previewEl.textContent = '';
-  }
-
-  ui.actionsEl.hidden = !(canOpen || showOpenAll);
-  ui.openBtn.hidden = !canOpen;
-  ui.openBtn.disabled = !canOpen || opts.openDisabled === true;
-  ui.openBtn.textContent =
-    typeof opts.openPrimaryLabel === 'string' && opts.openPrimaryLabel.trim()
-      ? opts.openPrimaryLabel.trim()
-      : PRIMARY_LABEL_WITH_PICKER;
+  ui.actionsEl.hidden = !showContentCard;
+  ui.openBtn.hidden = !showContentCard;
+  ui.openBtn.disabled = !showContentCard || !canOpen || openDisabled;
+  setOpenLabel(ui, openPrimaryLabel);
   ui.openBtn.onclick = () => {
-    if (!previewUrl) return;
-    openUrlsInNewTabs([previewUrl]);
-    scheduleCloseLibrary(actions);
+    if (!openUrl) return;
+    openUrlsInNewTabs([openUrl]);
   };
 
   ui.openAllBtn.hidden = !showOpenAll;
   ui.openAllBtn.disabled = false;
-  ui.openAllBtn.onclick =
-    showOpenAll && typeof opts.openAllClick === 'function' ? opts.openAllClick : null;
+  ui.openAllBtn.onclick = showOpenAll && typeof openAllClick === 'function' ? openAllClick : null;
+
+  const previewAllowed = !bulkDisabled && hasAemFetch && Boolean(toolAccess?.canPreview);
+  const publishAllowed = !bulkDisabled && hasAemFetch && Boolean(toolAccess?.canPublish);
+
+  wireBulkBtn(ui.previewAllBtn, {
+    hidden: !showPreviewAll,
+    disabled: !previewAllowed,
+    title: previewAllowed ? '' : permissionDeniedMessageForPreview(),
+    onClick: previewAllowed && typeof previewAllClick === 'function' ? previewAllClick : null,
+  });
+  wireBulkBtn(ui.publishAllBtn, {
+    hidden: !showPublishAll,
+    disabled: !publishAllowed,
+    title: publishAllowed ? '' : publishDeniedHoverHint(),
+    onClick: publishAllowed && typeof publishAllClick === 'function' ? publishAllClick : null,
+  });
+}
+
+function setPanelLoading(isLoading) {
+  const panel = getPanel();
+  const compact = document.querySelector('.ls-loading-compact');
+  if (!panel) return;
+  const loading = Boolean(isLoading);
+  panel.classList.toggle('ls-loading', loading);
+  if (loading) panel.classList.remove('ls-pending');
+  panel.setAttribute('aria-busy', loading ? 'true' : 'false');
+  if (compact) compact.setAttribute('aria-busy', loading ? 'true' : 'false');
+}
+
+function finishPanelLoading() {
+  setPanelLoading(false);
 }
 
 function setPanelTwoLanguagesMode(isTwo) {
-  document.querySelector('.ls-panel')?.classList.toggle('ls-panel-two-languages', Boolean(isTwo));
+  getPanel()?.classList.toggle('ls-panel-two-languages', Boolean(isTwo));
 }
 
 function canonLocale(segment, keys) {
@@ -168,11 +310,8 @@ async function loadPlaceholderRows(org, repo, branch, tier, sheetName, ttlMs, ac
 }
 
 function findLocaleSegmentIndex(segments, langKeys) {
-  const set = new Set(langKeys.map((k) => k.toLowerCase()));
-  for (let i = 0; i < segments.length; i += 1) {
-    if (set.has(segments[i].toLowerCase())) return i;
-  }
-  return -1;
+  const locales = new Set(langKeys.map((k) => k.toLowerCase()));
+  return segments.findIndex((seg) => locales.has(seg.toLowerCase()));
 }
 
 function mergeResolvedSegments(locIndex, segments, resolvedPath) {
@@ -183,7 +322,6 @@ let langComboboxOutsideCloseWired = false;
 let langMenuResizeListener = null;
 let langMenuCloseTimer = null;
 
-/** Must match `.lang-select-menu` transition duration (close cleanup runs after paint). */
 const LANG_MENU_TRANSITION_MS = 200;
 
 function initLangCombobox(ui, keys, currentKey, onPickLocale) {
@@ -227,14 +365,13 @@ function initLangCombobox(ui, keys, currentKey, onPickLocale) {
 
   const placeMenuBelowTrigger = () => {
     const r = ui.langTrigger.getBoundingClientRect();
-    const gap = 4;
-    const spaceBelow = window.innerHeight - r.bottom - gap - 8;
+    const spaceBelow = window.innerHeight - r.bottom - 8;
     const maxH = Math.max(100, spaceBelow);
     const s = ui.langMenu.style;
     s.position = 'fixed';
     s.left = `${r.left}px`;
     s.width = `${r.width}px`;
-    s.top = `${r.bottom + gap}px`;
+    s.top = `${r.bottom}px`;
     s.bottom = 'auto';
     s.right = 'auto';
     s.marginTop = '0';
@@ -268,7 +405,10 @@ function initLangCombobox(ui, keys, currentKey, onPickLocale) {
   };
 
   const setTriggerLabel = (loc) => {
-    if (ui.langValue) ui.langValue.textContent = loc;
+    if (!ui.langValue) return;
+    const picked = typeof loc === 'string' && loc.trim();
+    ui.langValue.textContent = picked ? formatLocaleDisplay(loc) : LANG_SELECT_PLACEHOLDER;
+    ui.langValue.classList.toggle('is-placeholder', !picked);
   };
 
   ui.langMenu.replaceChildren();
@@ -277,7 +417,7 @@ function initLangCombobox(ui, keys, currentKey, onPickLocale) {
     b.type = 'button';
     b.className = 'lang-select-option';
     b.setAttribute('role', 'option');
-    b.textContent = k;
+    b.textContent = formatLocaleDisplay(k);
     b.addEventListener('click', (ev) => {
       ev.stopPropagation();
       closeMenu();
@@ -313,8 +453,8 @@ function initLangCombobox(ui, keys, currentKey, onPickLocale) {
     langComboboxOutsideCloseWired = true;
   }
 
-  setTriggerLabel(first);
-  onPickLocale(first);
+  setTriggerLabel(null);
+  onPickLocale(null);
 }
 
 function buildDest(parsed, org, repo, newSegments, useBranch, tier, target, daView) {
@@ -347,10 +487,19 @@ function resolveSitePath(contextPath, org, repo, segments) {
   return p;
 }
 
+async function resolveToolAccess(actions, aemFetch, org, repo, sitePath) {
+  if (typeof actions?.daFetch === 'function') {
+    return checkDaContentAccess(actions.daFetch, org, repo, sitePath);
+  }
+  if (aemFetch) return AEM_FALLBACK_ACCESS;
+  return NO_DA_ACCESS;
+}
+
 async function main() {
-  const { context, actions } = await DA_SDK;
+  setPanelLoading(true);
+  const { context, actions, token } = await DA_SDK;
   const ui = getUi();
-  setPanelTwoLanguagesMode(false);
+  const aemFetch = createAemFetcher(actions, token);
 
   const pageUrl = contextToDaUrl({
     org: context.org,
@@ -360,33 +509,197 @@ async function main() {
   });
 
   if (!pageUrl) {
-    resolvedDaPageUrl = '';
-    setUi(
-      ui,
-      'Missing page context (org, repo, path). Open this tool from the Library while a document page is open.',
-      null,
-      false,
-      actions,
-    );
+    setUi(ui, {
+      status: 'Missing page context (org, repo, path). Open this tool from the Library while a document page is open.',
+    });
     return;
   }
 
-  resolvedDaPageUrl = pageUrl.href;
-  const uiSrc = { sourceUrl: pageUrl.href };
-  const show = (status, previewUrl, canOpen, extra = {}) => setUi(
-    ui,
-    status,
-    previewUrl,
-    canOpen,
-    actions,
-    { ...uiSrc, ...extra },
-  );
+  let uiState = {
+    status: '',
+    bulkMessage: '',
+    bulkMessageIsError: false,
+    bulkMessageIsLoading: false,
+    bulkMessageIsSuccess: false,
+    openUrl: null,
+    canOpen: false,
+    showLangRow: false,
+    showOpenAll: false,
+    showPreviewAll: false,
+    showPublishAll: false,
+    openDisabled: false,
+    bulkDisabled: false,
+    openPrimaryLabel: PRIMARY_LABEL_WITH_PICKER,
+    currentLocale: '',
+    openAllClick: null,
+    previewAllClick: null,
+    publishAllClick: null,
+  };
 
-  show('Loading placeholders…', null, false, { showLangRow: false });
+  let bulkMessageDismissTimer = null;
+
+  const bulkCtx = {
+    ready: false,
+    toolAccess: null,
+    hasAemFetch: Boolean(aemFetch),
+    targets: [],
+    pageListForTargets: () => [],
+    lastPreviewByLocale: {},
+  };
+
+  const rememberPreviewResults = (results) => {
+    bulkCtx.lastPreviewByLocale = Object.fromEntries(
+      results
+        .map((p) => [trimmed(p.locale).toLowerCase(), p])
+        .filter(([key]) => key),
+    );
+  };
+
+  const resetBulkMessageFlags = () => ({
+    bulkMessageIsError: false,
+    bulkMessageIsLoading: false,
+    bulkMessageIsSuccess: false,
+  });
+
+  const show = (patch = {}) => {
+    if (bulkMessageDismissTimer) {
+      clearTimeout(bulkMessageDismissTimer);
+      bulkMessageDismissTimer = null;
+    }
+    uiState = { ...uiState, ...patch };
+    setUi(ui, uiState);
+
+    const msg = trimmed(uiState.bulkMessage);
+    if (msg && !uiState.bulkMessageIsLoading && uiState.bulkMessageIsSuccess) {
+      bulkMessageDismissTimer = window.setTimeout(() => {
+        bulkMessageDismissTimer = null;
+        show({
+          bulkMessage: '',
+          bulkMessageIsError: false,
+          bulkMessageIsLoading: false,
+          bulkMessageIsSuccess: false,
+        });
+      }, BULK_MESSAGE_SUCCESS_DISMISS_MS);
+    }
+  };
+
+  const showBulkError = (bulkMessage) => {
+    show({ bulkMessage, ...resetBulkMessageFlags(), bulkMessageIsError: true });
+  };
+
+  const statusOnlyUi = {
+    showContentCard: false,
+    showLangRow: false,
+    showPreviewAll: false,
+    showPublishAll: false,
+  };
+
+  const bulkPreconditionError = (toolAccess, action) => {
+    if (!bulkCtx.ready) return 'Still loading…';
+    if (!aemFetch) return permissionDeniedMessage(action);
+    if (!toolAccess?.canRead) return permissionDeniedMessageForAccess();
+    if (action === 'preview' && !toolAccess?.canPreview) return permissionDeniedMessageForPreview();
+    if (action === 'publish' && !toolAccess?.canPublish) return permissionDeniedMessageForPublish();
+    if (!bulkCtx.targets.length) {
+      return action === 'preview' ? 'No languages to preview.' : 'No languages to publish.';
+    }
+    return null;
+  };
+
+  const runBulkAction = async ({
+    action,
+    loadingMessage,
+    failLabel,
+    summarizeLabel,
+    run,
+    mapResults,
+  }) => {
+    const err = bulkPreconditionError(bulkCtx.toolAccess, action);
+    if (err) {
+      showBulkError(err);
+      return;
+    }
+    show({ bulkMessage: loadingMessage, ...resetBulkMessageFlags(), bulkMessageIsLoading: true });
+    try {
+      const result = await run(bulkCtx.targets);
+      if (mapResults) rememberPreviewResults(mapResults(result));
+      const ok = action === 'publish'
+        ? result.length > 0 && result.every((p) => p.status === 200)
+        : result.every((p) => p.status === 200);
+      show({
+        bulkMessage: summarizeBulkResult(result, summarizeLabel, action),
+        ...resetBulkMessageFlags(),
+        bulkMessageIsSuccess: ok,
+        bulkMessageIsError: !ok,
+      });
+    } catch (e) {
+      showBulkError(`${failLabel} failed: ${e.message || String(e)}`);
+    }
+  };
+
+  const previewAllClick = () => runBulkAction({
+    action: 'preview',
+    loadingMessage: 'Previewing…',
+    failLabel: 'Preview',
+    summarizeLabel: 'previewed',
+    run: (targets) => previewPages(bulkCtx.pageListForTargets(targets), aemFetch),
+    mapResults: (result) => result,
+  });
+
+  const publishAllClick = () => runBulkAction({
+    action: 'publish',
+    loadingMessage: 'Publishing…',
+    failLabel: 'Publish',
+    summarizeLabel: 'published',
+    run: (targets) => publishPages(bulkCtx.pageListForTargets(targets), aemFetch),
+    mapResults: (published) => published.map((p) => ({
+      locale: p.locale,
+      status: p.previewStatus ?? p.status,
+      error: p.error,
+    })),
+  });
+
+  const readyUi = (toolAccess) => ({
+    showContentCard: true,
+    showPreviewAll: true,
+    showPublishAll: true,
+    bulkDisabled: false,
+    hasAemFetch: Boolean(aemFetch),
+    toolAccess,
+    previewAllClick,
+    publishAllClick,
+  });
+
+  const finishLoading = (patch = {}) => {
+    finishPanelLoading();
+    const access = patch.toolAccess ?? bulkCtx.toolAccess;
+    show({
+      bulkMessage: '',
+      bulkMessageIsLoading: false,
+      ...readyUi(access),
+      ...patch,
+    });
+  };
+
+  const finishWithWarning = (status) => {
+    finishLoading({ status, statusIsWarning: true, ...statusOnlyUi });
+  };
+
+  show({
+    status: '',
+    bulkMessage: '',
+    showContentCard: false,
+    showLangRow: false,
+    showPreviewAll: false,
+    showPublishAll: false,
+    ...resetBulkMessageFlags(),
+  });
 
   const parsed = parseCurrentPage(pageUrl);
   if (!parsed) {
-    show('Could not parse this page (need /org/repo/locale/… in context.path).', null, false);
+    finishWithWarning(
+      'Could not read this page path. Open Language Switcher from a document under org/repo/locale/…',
+    );
     return;
   }
 
@@ -395,7 +708,9 @@ async function main() {
   const segments = [...parsed.segments];
 
   if (!segments.length) {
-    show('Path must include a locale folder after org/repo.', null, false);
+    finishWithWarning(
+      'This path has no locale folder after org/repo. Open a page such as /en/… or /fr/…',
+    );
     return;
   }
 
@@ -415,60 +730,35 @@ async function main() {
       sitePath,
     );
   } catch (e) {
-    show(`Could not load placeholders.json (${e.message}).`, null, false);
+    finishWithWarning(String(e?.message || e || 'Could not find placeholders.json.'));
     return;
   }
 
   const langKeys = detectLocaleColumnKeys(rows);
   setPanelTwoLanguagesMode(langKeys.length === 2);
+  const sheetLabel = placeholderSheetName || DEFAULT_SHEET;
 
   if (!langKeys.length) {
-    show(
-      'No path columns found in language-switcher (values should start with /, e.g. en, fr).',
-      null,
-      false,
+    finishWithWarning(
+      `Could not find language paths in the "${sheetLabel}" sheet. Add columns (e.g. en, fr) whose values start with /.`,
     );
     return;
   }
 
   const locIndex = findLocaleSegmentIndex(segments, langKeys);
   if (locIndex < 0) {
-    show(`No folder in this path matches a language column (${langKeys.join(', ')}).`, null, false);
+    finishWithWarning(
+      `This page is not inside a language folder. Open a document under ${langKeys.map((k) => `/${k}`).join(', ')} to use Language Mapper.`,
+    );
     return;
   }
+
+  const toolAccess = await resolveToolAccess(actions, aemFetch, org, repo, sitePath);
 
   const urlSeg = segments[locIndex];
   const afterLoc = pathAfterLocale(segments.slice(locIndex));
   const showLangPicker = langKeys.length >= 3;
-
-  if (langKeys.length === 1) {
-    ui.langRow.hidden = true;
-    const [only] = langKeys;
-    if (urlSeg.toLowerCase() === only.toLowerCase()) {
-      show(
-        `Already on ${only}. Add another language column to map paths, or open a page in a different locale folder.`,
-        null,
-        false,
-      );
-      return;
-    }
-    const newSeg = [...segments.slice(0, locIndex), only, ...segments.slice(locIndex + 1)];
-    show('', buildDest(parsed, org, repo, newSeg, useBranch, tier, target, daView), true, {
-      showLangRow: false,
-      openPrimaryLabel: `Open page in ${only}`,
-    });
-    return;
-  }
-
   const fromLoc = canonLocale(urlSeg, langKeys);
-  if (!fromLoc) {
-    show(
-      `This page’s locale folder is "${urlSeg}" but placeholders only define: ${langKeys.join(', ')}.`,
-      null,
-      false,
-    );
-    return;
-  }
 
   const pathCache = new Map();
   const getResolvedPath = (toLoc) => {
@@ -488,35 +778,94 @@ async function main() {
     daView,
   );
 
-  const openAllOpts = () => ({
-    showOpenAll: langKeys.length > 2,
-    openAllClick: () => {
-      const urls = langKeys
-        .filter((to) => to.toLowerCase() !== fromLoc.toLowerCase())
-        .map(urlForLocale);
-      openUrlsInNewTabs(urls);
-      if (urls.length) scheduleCloseLibrary(actions);
-    },
-  });
+  const segmentsForLocale = (toLoc) => mergeResolvedSegments(
+    locIndex,
+    segments,
+    getResolvedPath(toLoc),
+  );
 
-  const applyDestination = (toLoc) => {
-    if (toLoc.toLowerCase() === fromLoc.toLowerCase()) {
-      show('Choose a language different from the current page.', null, true, {
-        showLangRow: showLangPicker,
-        openDisabled: true,
-        openPrimaryLabel: PRIMARY_LABEL_WITH_PICKER,
-        ...openAllOpts(),
+  const pageListForTargets = (targets) => targets.map((loc) => ({
+    locale: loc,
+    path: buildAemAdminPath(org, repo, segmentsForLocale(loc)),
+  }));
+
+  bulkCtx.ready = true;
+  bulkCtx.toolAccess = toolAccess;
+  bulkCtx.targets = langKeys;
+  bulkCtx.pageListForTargets = pageListForTargets;
+
+  const openAllClickHandler = () => {
+    const targets = bulkCtx.targets;
+    const others = fromLoc
+      ? targets.filter((to) => to.toLowerCase() !== fromLoc.toLowerCase())
+      : targets;
+    const urls = others.map(urlForLocale);
+    openUrlsInNewTabs(urls);
+  };
+
+  if (langKeys.length === 1) {
+    const [only] = langKeys;
+    if (urlSeg.toLowerCase() === only.toLowerCase()) {
+      finishLoading({
+        status: `Already on ${only}. Add another language column to map paths, or open a page in a different locale folder.`,
+        showLangRow: false,
+        canOpen: false,
       });
       return;
     }
-    show('', urlForLocale(toLoc), true, {
+    const newSeg = [...segments.slice(0, locIndex), only, ...segments.slice(locIndex + 1)];
+    finishLoading({
+      status: '',
+      canOpen: true,
+      openUrl: buildDest(parsed, org, repo, newSeg, useBranch, tier, target, daView),
+      showLangRow: false,
+      openDisabled: false,
+      openPrimaryLabel: openPageInLabel(only),
+    });
+    return;
+  }
+
+  if (!fromLoc) {
+    finishLoading({
+      status: `This page’s locale folder is "${urlSeg}" but placeholders only define: ${langKeys.join(', ')}.`,
+      showLangRow: false,
+      canOpen: false,
+    });
+    return;
+  }
+
+  const showOpenState = ({ openUrl, openDisabled, openPrimaryLabel }) => {
+    show({
+      status: '',
+      canOpen: true,
+      openUrl,
+      openDisabled,
       showLangRow: showLangPicker,
-      openPrimaryLabel: showLangPicker
-        ? PRIMARY_LABEL_WITH_PICKER
-        : `Open page in ${toLoc}`,
-      ...openAllOpts(),
+      openPrimaryLabel: openPrimaryLabel ?? PRIMARY_LABEL_WITH_PICKER,
     });
   };
+
+  const applyDestination = (toLoc) => {
+    if (!toLoc || toLoc.toLowerCase() === fromLoc.toLowerCase()) {
+      showOpenState({ openUrl: null, openDisabled: true });
+      return;
+    }
+    showOpenState({
+      openUrl: urlForLocale(toLoc),
+      openDisabled: false,
+      openPrimaryLabel: showLangPicker ? PRIMARY_LABEL_WITH_PICKER : openPageInLabel(toLoc),
+    });
+  };
+
+  finishLoading({
+    status: '',
+    currentLocale: fromLoc || urlSeg,
+    showLangRow: showLangPicker,
+    showOpenAll: langKeys.length > 2,
+    openAllClick: openAllClickHandler,
+    canOpen: true,
+    openDisabled: Boolean(showLangPicker),
+  });
 
   if (showLangPicker) {
     initLangCombobox(ui, langKeys, fromLoc, applyDestination);
@@ -527,9 +876,12 @@ async function main() {
 
 main().catch((err) => {
   console.error(err);
+  finishPanelLoading();
+  getPanel()?.classList.remove('ls-pending');
   const el = document.getElementById('status');
   if (el) {
     el.textContent = `Error: ${err.message || String(err)}`;
     el.hidden = false;
+    el.classList.add('is-warning');
   }
 });
