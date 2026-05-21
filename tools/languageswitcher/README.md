@@ -1,9 +1,9 @@
-# Language Mapper
+# Language Switcher
 
 A Document Authoring (DA) **library plugin** that helps authors jump to the same page in other locales and run bulk **preview** / **publish** for every language defined in **`placeholders.json`**.
 
 ## Overview
-Language Mapper is for same-page, different-language navigation. It helps authors jump to the equivalent 
+Language Switcher is for same-page, different-language navigation. It helps authors jump to the equivalent 
 path for the document they are editing.
 
 ## Features
@@ -41,7 +41,7 @@ path for the document they are editing.
 ![Example UI:](placeholders.png)
 
 3. Open the page you want to switch from (any supported language) in DA
-4. Open DA Language Mapper from the Library. 
+4. Open DA Language Switcher from the Library. 
 5. Choose a language if the dropdown appears(for more than 2 languages). Choose one of the available actions:
   a) Open Page for Selected Language → Opens the equivalent page in the chosen language
   b) Open Page for All Languages → Opens all available localized versions of the current page
@@ -70,7 +70,7 @@ tools/languageswitcher/
 
 | title | path | icon | experience |
 | ----- | ---- | ---- | ---------- |
-| `Language Mapper` | `/tools/languageswitcher/languageswitcher.html` | `https://main--<repo>--<org>.aem.page/tools/languageswitcher/icons/language-icon.svg` | `dialog` |
+| `Language Switcher` | `/tools/languageswitcher/languageswitcher.html` | `https://main--<repo>--<org>.aem.page/tools/languageswitcher/icons/language-icon.svg` | `dialog` |
 
 ## Loading
 
@@ -91,6 +91,7 @@ If corresponding localized pages (example: en ↔ fr) do not exist, the plugin d
 3. Preview/Publish Access & Validation Errors: 
 During preview/publish operations, the plugin validates access for every localized page. If any operation fails, corresponding status/error messages are displayed for that specific language page.
 
+![Publish/Preview Access:](error3.png)
 
 ## Points To Note:
 
